@@ -1,7 +1,6 @@
 require 'fileutils'
 
 module Pod
-
   # The sandbox provides support for the directory that CocoaPods uses for an
   # installation. In this directory the Pods projects, the support files and
   # the sources of the Pods are stored.
@@ -12,44 +11,44 @@ module Pod
   #
   #     Pods
   #     |
-  #     +-- User
-  #     | +-- [Target Name]-configuration.h
-  #     | +-- Specs
-  #     | +-- Scripts
+  #     +-- Headers
+  #     |   +-- Private
+  #     |   |   +-- [Pod Name]
+  #     |   +-- Public
+  #     |       +-- [Pod Name]
   #     |
-  #     +-- Generated
-  #       +-- Headers
-  #       |   +-- Private
-  #       |   |   +-- [Pod Name]
-  #       |   +-- Public
-  #       |       +-- [Pod Name]
-  #       |
-  #       +-- Sources
-  #       |   +-- [Pod Name]
-  #       |
-  #       +-- Specs
-  #       |   +-- External Sources
-  #       |   +-- Normal Sources
-  #       |
-  #       +-- Target Support Files
-  #       |   +-- [Target Name]
-  #       |       +-- Pods-acknowledgements.markdown
-  #       |       +-- Pods-acknowledgements.plist
-  #       |       +-- Pods-dummy.m
-  #       |       +-- Pods-prefix.pch
-  #       |       +-- Pods.xcconfig
-  #       |
-  #       +-- Manifest.lock
-  #       |
-  #       +-- Pods.xcodeproj
+  #     +-- Local Podspecs
+  #     |   +-- External Sources
+  #     |   +-- Normal Sources
+  #     |
+  #     +-- Target Support Files
+  #     |   +-- [Target Name]
+  #     |       +-- Pods-acknowledgements.markdown
+  #     |       +-- Pods-acknowledgements.plist
+  #     |       +-- Pods-dummy.m
+  #     |       +-- Pods-prefix.pch
+  #     |       +-- Pods.xcconfig
+  #     |
+  #     +-- [Pod Name]
+  #     |
+  #     +-- Manifest.lock
+  #     |
+  #     +-- Pods.xcodeproj
+  #  (if installation option 'generate_multiple_pod_projects' is enabled)
+  #     |
+  #     +-- PodTarget1.xcodeproj
+  #     |
+  #    ...
+  #     |
+  #     +-- PodTargetN.xcodeproj
   #
-  # See #833
   #
   class Sandbox
-
-    autoload :FileAccessor, 'cocoapods/sandbox/file_accessor'
-    autoload :HeadersStore, 'cocoapods/sandbox/headers_store'
-    autoload :PathList,     'cocoapods/sandbox/path_list'
+    autoload :FileAccessor,  'cocoapods/sandbox/file_accessor'
+    autoload :HeadersStore,  'cocoapods/sandbox/headers_store'
+    autoload :PathList,      'cocoapods/sandbox/path_list'
+    autoload :PodDirCleaner, 'cocoapods/sandbox/pod_dir_cleaner'
+    autoload :PodspecFinder, 'cocoapods/sandbox/podspec_finder'
 
     # @return [Pathname] the root of the sandbox.
     #
@@ -59,49 +58,54 @@ module Pod
     #
     attr_reader :public_headers
 
-    # @param [String, Pathname] root @see root
+    # Initialize a new instance
+    #
+    # @param [String, Pathname] root @see #root
     #
     def initialize(root)
-      @root = Pathname.new(root)
-      @public_headers = HeadersStore.new(self, "Headers")
+      FileUtils.mkdir_p(root)
+      @root = Pathname.new(root).realpath
+      @public_headers = HeadersStore.new(self, 'Public', :public)
       @predownloaded_pods = []
-      @head_pods = []
+      @downloaded_pods = []
       @checkout_sources = {}
       @development_pods = {}
-      FileUtils.mkdir_p(@root)
+      @pods_with_absolute_path = []
+      @stored_podspecs = {}
     end
 
     # @return [Lockfile] the manifest which contains the information about the
-    #         installed pods.
+    #         installed pods or `nil` if one is not present.
     #
     def manifest
-      Lockfile.from_file(manifest_path) if manifest_path.exist?
-    end
-
-    # @return [Project] the Pods project.
-    #
-    attr_accessor :project
-
-    # Removes the sandbox.
-    #
-    # @return [void]
-    #
-    def implode
-      root.rmtree
+      @manifest ||= begin
+        Lockfile.from_file(manifest_path) if manifest_path.exist?
+      end
     end
 
     # Removes the files of the Pod with the given name from the sandbox.
     #
+    # @param [String] name The name of the pod, which is used to calculate additional paths to clean.
+    # @param [String] pod_dir The directory of the pod to clean.
+    #
     # @return [void]
     #
-    def clean_pod(name)
-      root_name = Specification.root_name(name)
-      unless local?(root_name)
-        path = pod_dir(name)
-        path.rmtree if path.exist?
-      end
-      podspe_path = specification_path(name)
-      podspe_path.rmtree if podspe_path
+    def clean_pod(name, pod_dir)
+      pod_dir.rmtree if pod_dir&.exist?
+      podspec_path = specification_path(name)
+      podspec_path.rmtree if podspec_path&.exist?
+      pod_target_project_path = pod_target_project_path(name)
+      pod_target_project_path.rmtree if pod_target_project_path&.exist?
+    end
+
+    # Prepares the sandbox for a new installation removing any file that will
+    # be regenerated and ensuring that the directories exists.
+    #
+    def prepare
+      FileUtils.mkdir_p(headers_root)
+      FileUtils.mkdir_p(sources_root)
+      FileUtils.mkdir_p(specifications_root)
+      FileUtils.mkdir_p(target_support_files_root)
     end
 
     # @return [String] a string representation suitable for debugging.
@@ -119,26 +123,52 @@ module Pod
     # @return [Pathname] the path of the manifest.
     #
     def manifest_path
-      root + "Manifest.lock"
+      root + 'Manifest.lock'
     end
 
     # @return [Pathname] the path of the Pods project.
     #
     def project_path
-      root + "Pods.xcodeproj"
+      root + 'Pods.xcodeproj'
     end
 
-    # Returns the path for the directory where to store the support files of
-    # a target.
+    # @return [Pathname] the path of the installation cache.
+    #
+    def project_installation_cache_path
+      root.join('.project_cache', 'installation_cache.yaml')
+    end
+
+    # @return [Pathname] the path of the metadata cache.
+    #
+    def project_metadata_cache_path
+      root.join('.project_cache', 'metadata_cache.yaml')
+    end
+
+    # @return [Pathname] the path of the version cache.
+    #
+    def project_version_cache_path
+      root.join('.project_cache', 'version')
+    end
+
+    # @param [String] pod_target_name
+    # Name of the pod target used to generate the path of its Xcode project.
+    #
+    # @return [Pathname] the path of the project for a pod target.
+    #
+    def pod_target_project_path(pod_target_name)
+      root + "#{pod_target_name}.xcodeproj"
+    end
+
+    # Returns the path for the directory where the support files of
+    # a target are stored.
     #
     # @param  [String] name
     #         The name of the target.
     #
     # @return [Pathname] the path of the support files.
     #
-    def library_support_files_dir(name)
-      # root + "Target Support Files/#{name}"
-      root
+    def target_support_files_dir(name)
+      target_support_files_root + name
     end
 
     # Returns the path where the Pod with the given name is stored, taking into
@@ -152,17 +182,47 @@ module Pod
     def pod_dir(name)
       root_name = Specification.root_name(name)
       if local?(root_name)
-        Pathname.new(development_pods[root_name])
+        Pathname.new(development_pods[root_name].dirname)
       else
-        # root + "Sources/#{name}"
-        root + root_name
+        sources_root + root_name
       end
     end
 
-    # @return [Pathname] the directory where to store the documentation.
+    # Returns true if the path as originally specified was absolute.
     #
-    def documentation_dir
-      root + 'Documentation'
+    # @param  [String] name
+    #
+    # @return [Boolean] true if originally absolute
+    #
+    def local_path_was_absolute?(name)
+      @pods_with_absolute_path.include? name
+    end
+
+    # @return [Pathname] The directory where headers are stored.
+    #
+    def headers_root
+      root + 'Headers'
+    end
+
+    # @return [Pathname] The directory where the downloaded sources of
+    #         the Pods are stored.
+    #
+    def sources_root
+      root
+    end
+
+    # @return [Pathname] the path for the directory where the
+    #         specifications are stored.
+    #
+    def specifications_root
+      root + 'Local Podspecs'
+    end
+
+    # @return [Pathname] The directory where the files generated by
+    #         CocoaPods to support the umbrella targets are stored.
+    #
+    def target_support_files_root
+      root + 'Target Support Files'
     end
 
     #-------------------------------------------------------------------------#
@@ -179,20 +239,10 @@ module Pod
     # @return [Specification] the specification if the file is found.
     #
     def specification(name)
-      if file = specification_path(name)
-        Specification.from_file(file)
+      @stored_podspecs[name] ||= if file = specification_path(name)
+                                   original_path = development_pods[name]
+                                   Specification.from_file(original_path || file)
       end
-    end
-
-    # @return [Pathname] the path for the directory where to store the
-    #         specifications.
-    #
-    # @todo   Migrate old installations and store the for all the pods.
-    #         Two folders should be created `External Sources` and `Podspecs`.
-    #
-    def specifications_dir(external_source = false)
-      # root + "Specifications"
-      root + "Local Podspecs"
     end
 
     # Returns the path of the specification for the Pod with the
@@ -205,37 +255,62 @@ module Pod
     # @return [Nil] if the podspec is not stored.
     #
     def specification_path(name)
-      path = specifications_dir + "#{name}.podspec"
-      path.exist? ? path : nil
+      name = Specification.root_name(name)
+      path = specifications_root + "#{name}.podspec"
+      if path.exist?
+        path
+      else
+        path = specifications_root + "#{name}.podspec.json"
+        if path.exist?
+          path
+        end
+      end
     end
 
     # Stores a specification in the `Local Podspecs` folder.
     #
-    # @param  [Sandbox] sandbox
-    #         the sandbox where the podspec should be stored.
+    # @param  [String] name
+    #         the name of the pod
     #
-    # @param  [String, Pathname] podspec
+    # @param  [String, Pathname, Specification] podspec
     #         The contents of the specification (String) or the path to a
     #         podspec file (Pathname).
     #
-    # @todo   Store all the specifications (including those not originating
-    #         from external sources) so users can check them.
+    # @return [void]
     #
-    def store_podspec(name, podspec, external_source = false)
-      output_path = specifications_dir(external_source) + "#{name}.podspec"
-      output_path.dirname.mkpath
-      if podspec.is_a?(String)
-        output_path.open('w') { |f| f.puts(podspec) }
-      else
-        unless podspec.exist?
-          raise Informative, "No podspec found for `#{name}` in #{podspec}"
+    #
+    def store_podspec(name, podspec, _external_source = false, json = false)
+      file_name = json ? "#{name}.podspec.json" : "#{name}.podspec"
+      output_path = specifications_root + file_name
+
+      spec =
+        case podspec
+        when String
+          Sandbox.update_changed_file(output_path, podspec)
+          Specification.from_file(output_path)
+        when Pathname
+          unless podspec.exist?
+            raise Informative, "No podspec found for `#{name}` in #{podspec}"
+          end
+          FileUtils.copy(podspec, output_path)
+          Specification.from_file(podspec)
+        when Specification
+          raise ArgumentError, 'can only store Specification objects as json' unless json
+          Sandbox.update_changed_file(output_path, podspec.to_pretty_json)
+          podspec.dup
+        else
+          raise ArgumentError, "Unknown type for podspec: #{podspec.inspect}"
         end
-        FileUtils.copy(podspec, output_path)
-      end
-      spec = Specification.from_file(output_path)
+
+      # we force the file to be the file in the sandbox, so specs that have been serialized to
+      # json maintain a consistent checksum.
+      # this is safe to do because `spec` is always a clean instance
+      spec.defined_in_file = output_path
+
       unless spec.name == name
         raise Informative, "The name of the given podspec `#{spec.name}` doesn't match the expected one `#{name}`"
       end
+      @stored_podspecs[spec.name] = spec
     end
 
     #-------------------------------------------------------------------------#
@@ -267,7 +342,7 @@ module Pod
     # @param  [String] name
     #         The name of the Pod.
     #
-    # @return [Bool] Whether the Pod has been pre-downloaded.
+    # @return [Boolean] Whether the Pod has been pre-downloaded.
     #
     def predownloaded?(name)
       root_name = Specification.root_name(name)
@@ -276,34 +351,39 @@ module Pod
 
     #--------------------------------------#
 
-    # Marks a Pod as head.
+    # Marks a Pod as downloaded
     #
     # @param  [String] name
     #         The name of the Pod.
     #
     # @return [void]
     #
-    def store_head_pod(name)
+    def store_downloaded_pod(name)
       root_name = Specification.root_name(name)
-      head_pods << root_name
+      downloaded_pods << root_name
     end
 
-    # @return [Array<String>] The names of the pods that have been
-    #         marked as head.
-    #
-    attr_reader :head_pods
-
-    # Checks if a Pod should attempt to use the head source of the git repo.
+    # Checks if a Pod has been downloaded before the installation
+    # process.
     #
     # @param  [String] name
     #         The name of the Pod.
     #
-    # @return [Bool] Whether the Pod has been marked as head.
+    # @return [Boolean] Whether the Pod has been downloaded.
     #
-    def head_pod?(name)
+    def downloaded?(name)
       root_name = Specification.root_name(name)
-      head_pods.include?(root_name)
+      downloaded_pods.include?(root_name)
     end
+
+    # @return [Array<String>] The names of the pods that have been
+    #         downloaded before the installation process begins.
+    #         These are distinct from the pre-downloaded pods in
+    #         that these do not necessarily come from external
+    #         sources, and are only downloaded right before
+    #         installation if the parallel_pod_downloads option is on.
+    #
+    attr_reader :downloaded_pods
 
     #--------------------------------------#
 
@@ -323,6 +403,30 @@ module Pod
       checkout_sources[root_name] = source
     end
 
+    # Removes the checkout source of a Pod.
+    #
+    # @param  [String] name
+    #         The name of the Pod.
+    #
+    # @return [void]
+    #
+    def remove_checkout_source(name)
+      root_name = Specification.root_name(name)
+      checkout_sources.delete(root_name)
+    end
+
+    # Removes local podspec a Pod.
+    #
+    # @param  [String] name
+    #         The name of the Pod.
+    #
+    # @return [void]
+    #
+    def remove_local_podspec(name)
+      local_podspec = specification_path(name)
+      FileUtils.rm(local_podspec) if local_podspec
+    end
+
     # @return [Hash{String=>Hash}] The options necessary to recreate the exact
     #         checkout of a given Pod grouped by its name.
     #
@@ -335,20 +439,23 @@ module Pod
     # @param  [String] name
     #         The name of the Pod.
     #
-    # @param  [#to_s] path
-    #         The local path where the Pod is stored.
+    # @param  [Pathname, String] path
+    #         The path to the local Podspec
+    #
+    # @param  [Boolean] was_absolute
+    #         True if the specified local path was absolute.
     #
     # @return [void]
     #
-    def store_local_path(name, path)
+    def store_local_path(name, path, was_absolute = false)
       root_name = Specification.root_name(name)
-      development_pods[root_name] = path.to_s
+      path = Pathname.new(path) unless path.is_a?(Pathname)
+      development_pods[root_name] = path
+      @pods_with_absolute_path << root_name if was_absolute
     end
 
-    # @return [Hash{String=>String}] The path of the Pods with a local source
-    #         grouped by their name.
-    #
-    # @todo   Rename (e.g. `pods_with_local_path`)
+    # @return [Hash{String=>Pathname}] The path of the Pods' podspecs with a local source
+    #         grouped by their root name.
     #
     attr_reader :development_pods
 
@@ -357,15 +464,43 @@ module Pod
     # @param  [String] name
     #         The name of the Pod.
     #
-    # @return [Bool] Whether the Pod is locally sourced.
+    # @return [Boolean] Whether the Pod is locally sourced.
     #
     def local?(name)
+      !local_podspec(name).nil?
+    end
+
+    # @param  [String] name
+    #         The name of a locally specified Pod
+    #
+    # @return [Pathname] Path to the local Podspec of the Pod
+    #
+    def local_podspec(name)
       root_name = Specification.root_name(name)
-      !development_pods[root_name].nil?
+      development_pods[root_name]
+    end
+
+    # @!group Convenience Methods
+
+    # Writes a file if it does not exist or if its contents have changed.
+    #
+    # @param  [Pathname] path
+    #         The path to read from and write to.
+    #
+    # @param  [String] contents
+    #         The contents to write if they do not match or the file does not exist.
+    #
+    # @return [void]
+    #
+    def self.update_changed_file(path, contents)
+      if path.exist?
+        content_stream = StringIO.new(contents)
+        identical = File.open(path, 'rb') { |f| FileUtils.compare_stream(f, content_stream) }
+        return if identical
+      end
+      File.open(path, 'w') { |f| f.write(contents) }
     end
 
     #-------------------------------------------------------------------------#
-
   end
 end
-

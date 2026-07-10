@@ -1,407 +1,406 @@
-def execute_command(command)
-  if ENV['VERBOSE']
-    sh(command)
+require 'bundler'
+
+# Bootstrap task
+#-----------------------------------------------------------------------------#
+
+desc 'Initializes your working copy to run the specs'
+task :bootstrap, :use_bundle_dir? do |_, args|
+  title 'Environment bootstrap'
+
+  puts 'Updating submodules'
+  execute_command 'git submodule update --init --recursive'
+
+  if system('which bundle')
+    puts 'Installing gems'
+    if args[:use_bundle_dir?]
+      execute_command 'env bundle install --path ./travis_bundle_dir'
+    else
+      execute_command 'env bundle install'
+    end
   else
-    output = `#{command} 2>&1`
+    $stderr.puts "\033[0;31m" \
+      "[!] Please install the bundler gem manually:\n" \
+      '    $ [sudo] gem install bundler' \
+      "\e[0m"
+    exit 1
+  end
+end
+
+begin
+
+  task :build do
+    title 'Building the gem'
+  end
+
+  task :check_submodules do
+    title 'Ensuring submodules are initialized'
+    submodule_help_msg = 'Run git submodule update --init --recursive to ensure submodules are initialized'
+    raise submodule_help_msg if `git submodule status`.split("\n").any? do |line|
+      line.start_with? '-'
+    end
+  end
+
+  require 'bundler/gem_tasks'
+  require 'bundler/setup'
+
+  # Pre release
+  #-----------------------------------------------------------------------------#
+
+  desc 'Prepares for a release'
+  task :pre_release do
+  end
+
+  # Post release
+  #-----------------------------------------------------------------------------#
+
+  desc 'Updates the last known version of CocoaPods in the specs repo'
+  task :post_release do
+    puts yellow("\n[!] The `post_release` task of CocoaPods no longer updates the master specs repo last known version. " \
+                  'This is because of how slow it has become which can break the release process. ' \
+                  "Please use the GitHub UI to update it to the #{gem_version} version.\n")
+  end
+
+  # Spec
+  #-----------------------------------------------------------------------------#
+
+  namespace :spec do
+    def specs(dir)
+      FileList["spec/#{dir}_spec.rb"].shuffle.join(' ')
+    end
+
+    #--------------------------------------#
+
+    desc 'Automatically run specs for updated files'
+    task :kick do
+      exec 'bundle exec kicker -c'
+    end
+
+    #--------------------------------------#
+
+    unit_specs_command = "bundle exec bacon #{specs('unit/**/*')}"
+
+    desc 'Run the unit specs'
+    task :unit => 'fixture_tarballs:unpack' do
+      sh unit_specs_command
+    end
+
+    desc 'Run the unit specs quietly (fail fast, display only one failure)'
+    task :unit_quiet => 'fixture_tarballs:unpack' do
+      sh "#{unit_specs_command} -q"
+    end
+
+    #--------------------------------------#
+
+    desc 'Run the functional specs'
+    task :functional, [:spec] => 'fixture_tarballs:unpack' do |_t, args|
+      args.with_defaults(:spec => '**/*')
+      sh "bundle exec bacon #{specs("functional/#{args[:spec]}")}"
+    end
+
+    #--------------------------------------#
+
+    desc 'Run the integration spec'
+    task :integration do
+      unless File.exist?('spec/cocoapods-integration-specs')
+        $stderr.puts red('Integration files not checked out. Run `rake bootstrap`')
+        exit 1
+      end
+
+      sh 'bundle exec bacon spec/integration.rb'
+    end
+
+    # Default task
+    #--------------------------------------#
+    #
+    # The specs helper interfere with the integration 2 specs and thus they need
+    # to be run separately.
+    #
+    task :all => 'fixture_tarballs:unpack' do
+      tasks = ENV.fetch('COCOAPODS_CI_TASKS') { 'ALL' }.upcase.split(/\s+/)
+      if %w(ALL SPECS EXAMPLES LINT).&(tasks).empty?
+        raise "Unknown tasks #{tasks} -- supported options for COCOAPODS_CI_TASKS are " \
+              'ALL, SPECS, EXAMPLES, LINT'
+      end
+      specs = %w(ALL SPECS).&(tasks).any?
+      examples = %w(ALL EXAMPLES).&(tasks).any?
+      lint = %w(ALL LINT).&(tasks).any?
+
+      # Forcing colored to be included on String before Term::ANSIColor, so that Inch will work correctly.
+      require 'colored2'
+      ENV['GENERATE_COVERAGE'] = 'true'
+      puts "\033[0;32mUsing #{`ruby --version`}\033[0m"
+
+      if specs
+        title 'Running the specs'
+        Bundler.with_unbundled_env do
+          sh "bundle exec bacon #{specs('**/*')}"
+        end
+
+        title 'Running Integration tests'
+        Bundler.with_unbundled_env do
+          sh 'bundle exec bacon spec/integration.rb'
+        end
+      end
+
+      if examples && ENV['SKIP_EXAMPLES'].nil?
+        title 'Running examples'
+        Rake::Task['examples:build'].invoke
+      end
+
+      if lint
+        title 'Running RuboCop'
+        Rake::Task['rubocop'].invoke
+
+        title 'Running Inch'
+        Rake::Task['inch'].invoke
+      end
+    end
+
+    namespace :fixture_tarballs do
+      task :default => :unpack
+
+      tarballs = FileList['spec/fixtures/**/*.tar.gz']
+
+      desc 'Check fixture tarballs for pending changes'
+      task :check_for_pending_changes do
+        tarballs.each do |tarball|
+          repo_dir = "#{File.dirname(tarball)}/#{File.basename(tarball, '.tar.gz')}"
+          if Dir.exist?(repo_dir) && Dir.exist?("#{repo_dir}/.git") && !Dir.chdir(repo_dir) { `git status --porcelain`.empty? }
+            puts red("[!] There are unsaved changes in '#{repo_dir}'. " \
+              'Please commit everything and run `rake spec:fixture_tarballs:rebuild`.')
+            exit 1
+          end
+        end
+      end
+
+      desc 'Rebuild all the fixture tarballs'
+      task :rebuild => :check_for_pending_changes do
+        tarballs.each do |tarball|
+          basename = File.basename(tarball)
+          untarred_basename = File.basename(tarball, '.tar.gz')
+          sh "cd #{File.dirname(tarball)} rm #{basename} && env COPYFILE_DISABLE=1 tar -zcf #{basename} #{untarred_basename}"
+        end
+      end
+
+      desc 'Unpacks all the fixture tarballs'
+      task :unpack, :force do |_t, args|
+        begin
+          Rake::Task['spec:fixture_tarballs:check_for_pending_changes'].invoke
+        rescue SystemExit
+          exit 1 unless args[:force]
+          puts 'Continue anyway because `force` was applied.'
+        end
+        tarballs.each do |tarball|
+          basename = File.basename(tarball)
+          Dir.chdir(File.dirname(tarball)) do
+            sh "rm -rf #{basename[0..-8]} ; tar zxf #{basename}"
+          end
+        end
+      end
+    end
+
+    desc 'Removes the stored VCR fixture'
+    task :clean_vcr do
+      sh 'rm -f spec/fixtures/vcr/tarballs.yml'
+    end
+
+    desc 'Rebuilds integration fixtures'
+    task :rebuild_integration_fixtures do
+      unless system('which hg')
+        puts red('[!] Mercurial (`hg`) must be installed to rebuild the integration fixtures.')
+        exit 1
+      end
+      title 'Running Integration tests'
+      FileUtils.rm_rf 'tmp'
+      title 'Building all the fixtures'
+      sh('bundle exec bacon spec/integration.rb') {}
+      title 'Storing fixtures'
+      # Copy the files to the files produced by the specs to the after folders
+      FileList['tmp/*/transformed'].each do |source|
+        name = source.match(%r{^tmp/(.+)/transformed$})[1]
+        destination = "spec/cocoapods-integration-specs/#{name}/after"
+        if File.exist?(destination)
+          FileUtils.rm_rf destination
+          FileUtils.mv source, destination
+        end
+      end
+
+      puts
+      puts 'Integration fixtures updated, commit and push in the `spec/cocoapods-integration-specs` submodule'
+    end
+
+    task :clean_env => [:clean_vcr, 'fixture_tarballs:unpack', 'ext:cleanbuild']
+  end
+
+  # Examples
+  #-----------------------------------------------------------------------------#
+
+  task :examples => 'examples:build'
+  namespace :examples do
+    desc 'Open all example workspaces in Xcode, which recreates the schemes.'
+    task :recreate_workspace_schemes do
+      Dir['examples/*'].each do |example|
+        Dir.chdir(example.to_s) do
+          # TODO: we need to open the workspace in Xcode at least once, otherwise it might not contain schemes.
+          # The schemes do not seem to survive a SCM round-trip.
+          sh 'open *.xcworkspace'
+          sleep 5
+        end
+      end
+    end
+
+    desc 'pod install all examples'
+    task :pod_install do
+      Dir['examples/*'].sort.each do |dir|
+        next unless File.directory?(dir)
+        Dir.chdir(dir) do
+          puts "Example: #{dir}"
+
+          puts '    Installing Pods'
+          # pod_command = ENV['FROM_GEM'] ? 'sandbox-pod' : 'bundle exec ../../bin/sandbox-pod'
+          # TODO: The sandbox is blocking local git repos making bundler crash
+          pod_command = ENV['FROM_GEM'] ? 'sandbox-pod' : 'bundle exec pod'
+
+          execute_command 'rm -rf Pods'
+          execute_command "#{pod_command} install --verbose"
+        end
+      end
+    end
+
+    desc 'Build all examples'
+    task :build, [:pattern] do |_t, args|
+      Bundler.require 'xcodeproj', :development
+      pattern = if (p = args[:pattern])
+                  /#{p}/
+                else
+                  /.*/
+                end
+      Dir['examples/*'].sort.each do |dir|
+        next unless File.directory?(dir)
+        unless dir.match?(pattern)
+          puts "Skipping #{dir}"
+          next
+        end
+        Dir.chdir(dir) do
+          puts "Example: #{dir}"
+
+          puts '    Installing Pods'
+          # pod_command = ENV['FROM_GEM'] ? 'sandbox-pod' : 'bundle exec ../../bin/sandbox-pod'
+          # TODO: The sandbox is blocking local git repos making bundler crash
+          pod_command = ENV['FROM_GEM'] ? 'sandbox-pod' : 'bundle exec pod'
+
+          execute_command 'rm -rf Pods'
+          execute_command "#{pod_command} install --verbose"
+
+          workspace_path = 'Examples.xcworkspace'
+          workspace = Xcodeproj::Workspace.new_from_xcworkspace(workspace_path)
+          workspace.schemes.each do |scheme_name, project_path|
+            next if scheme_name == 'Pods'
+            next if project_path.end_with? 'Pods.xcodeproj'
+            build_action = scheme_name.start_with?('Test') ? 'test' : 'build'
+            puts "    #{build_action.capitalize}ing scheme: #{scheme_name}"
+
+            project = Xcodeproj::Project.open(project_path)
+            target = project.targets.first
+            scheme_target = project.targets.find { |t| t.name == scheme_name }
+            target = scheme_target unless scheme_target.nil?
+
+            xcodebuild_args = %W(
+              xcodebuild -workspace #{workspace_path} -scheme #{scheme_name} clean #{build_action}
+            )
+
+            case platform = target.platform_name
+            when :osx
+              execute_command(*xcodebuild_args)
+            when :ios
+              xcodebuild_args.concat ['ONLY_ACTIVE_ARCH=NO', 'CODE_SIGNING_ALLOWED=NO', '-destination', 'platform=iOS Simulator,name=iPhone 16 Pro']
+              execute_command(*xcodebuild_args)
+            when :watchos
+              xcodebuild_args.concat ['ONLY_ACTIVE_ARCH=NO', 'CODE_SIGNING_ALLOWED=NO', '-destination', 'platform=watchOS Simulator,name=Apple Watch Series 5 - 40mm']
+            else
+              raise "Unknown platform #{platform}"
+            end
+          end
+        end
+      end
+    end
+  end
+
+  #-----------------------------------------------------------------------------#
+
+  desc 'Run all specs'
+  task :spec => [:check_submodules, 'spec:all']
+
+  task :default => :spec
+
+  #-- Rubocop ----------------------------------------------------------------#
+
+  desc 'Check code against RuboCop rules'
+  task :rubocop do
+    sh 'bundle exec rubocop lib spec Rakefile'
+  end
+
+  #-- Inch -------------------------------------------------------------------#
+
+  require 'inch_by_inch/rake_task'
+  InchByInch::RakeTask.new
+
+  #-- Danger -----------------------------------------------------------------#
+
+  desc 'Run Danger to check PRs'
+  task :danger do
+    sh 'bundle exec danger' do |ok, _status|
+      raise 'Danger has found errors. Please refer to your PR for more information.' unless ok
+    end
+  end
+
+rescue LoadError, NameError => e
+  $stderr.puts "\033[0;31m" \
+    '[!] Some Rake tasks haven been disabled because the environment' \
+    ' couldn’t be loaded. Be sure to run `rake bootstrap` first or use the ' \
+    "VERBOSE environment variable to see errors.\e[0m"
+  if ENV['VERBOSE']
+    $stderr.puts e.message
+    $stderr.puts e.backtrace
+    $stderr.puts
+  end
+end
+
+# Helpers
+#-----------------------------------------------------------------------------#
+
+def execute_command(*command)
+  if ENV['VERBOSE']
+    sh(*command)
+  else
+    args = command.size == 1 ? "#{command.first} 2>&1" : [*command, :err => %i(child out)]
+    output = IO.popen(args, &:read)
     raise output unless $?.success?
   end
 end
 
-#-----------------------------------------------------------------------------#
-
-namespace :gem do
-
-  def gem_version
-    require File.expand_path('../lib/cocoapods/gem_version.rb', __FILE__)
-    Pod::VERSION
-  end
-
-  def gem_filename
-    "cocoapods-#{gem_version}.gem"
-  end
-
-  #--------------------------------------#
-
-  desc "Build a gem for the current version"
-  task :build do
-    sh "gem build cocoapods.gemspec"
-  end
-
-  #--------------------------------------#
-
-  desc "Install a gem version of the current code"
-  task :install => :build do
-    sh "gem install #{gem_filename}"
-  end
-
-  #--------------------------------------#
-
-  def silent_sh(command)
-    output = `#{command} 2>&1`
-    unless $?.success?
-      puts output
-      exit 1
-    end
-    output
-  end
-
-  desc "Run all specs, build and install gem, commit version change, tag version change, and push everything"
-  task :release do
-
-    unless ENV['SKIP_CHECKS']
-      if `git symbolic-ref HEAD 2>/dev/null`.strip.split('/').last != 'master'
-        $stderr.puts "[!] You need to be on the `master' branch in order to be able to do a release."
-        exit 1
-      end
-
-      if `git tag`.strip.split("\n").include?(gem_version)
-        $stderr.puts "[!] A tag for version `#{gem_version}' already exists. Change the version in lib/cocoapods/gem_version.rb"
-        silent_sh "open lib/cocoapods/gem_version.rb"
-        exit 1
-      end
-
-      diff_lines = `git diff --name-only`.strip.split("\n")
-      diff_lines.delete('CHANGELOG.md')
-      diff_lines.delete('Gemfile.lock')
-
-      if diff_lines.size == 0
-        $stderr.puts "[!] Change the version number yourself in lib/cocoapods/gem_version.rb"
-        exit 1
-      end
-
-      if diff_lines != ['lib/cocoapods/gem_version.rb']
-        $stderr.puts "[!] Only change the version number in a release commit!"
-        exit 1
-      end
-
-      puts "You are about to release `#{gem_version}', is that correct? [y/n]"
-      exit if $stdin.gets.strip.downcase != 'y'
-
-    end
-
-    require 'date'
-
-    # First check if the required gems have been pushed
-    gem_spec = eval(File.read(File.expand_path('../cocoapods.gemspec', __FILE__)))
-    gem_names = ['xcodeproj', 'cocoapods-core', 'cocoapods-downloader', 'claide']
-    gem_names.each do |gem_name|
-      gem = gem_spec.dependencies.find { |d| d.name == gem_name }
-      required_version = gem.requirement.requirements.first.last.to_s
-
-      puts "* Checking if #{gem_name} #{required_version} exists on the gem host"
-      search_result = silent_sh("gem search --all --pre --remote #{gem_name}")
-      remote_versions = search_result.match(/#{gem_name} \((.*)\)/m)[1].split(', ')
-      unless remote_versions.include?(required_version)
-        $stderr.puts "[!] The #{gem_name} version `#{required_version}' required by " \
-          "this version of CocoaPods does not exist on the gem host. " \
-          "Either push that first, or fix the version requirement."
-        exit 1
-      end
-    end
-
-    # Ensure that the branches are up to date with the remote
-    sh "git pull"
-
-    puts "* Updating Bundle"
-    silent_sh('bundle update')
-
-    puts "* Running specs"
-    silent_sh('rake spec:all')
-
-    tmp = File.expand_path('../tmp', __FILE__)
-    tmp_gems = File.join(tmp, 'gems')
-
-    Rake::Task['gem:build'].invoke
-
-    puts "* Testing gem installation (tmp/gems)"
-    silent_sh "rm -rf '#{tmp}'"
-    silent_sh "gem install --install-dir='#{tmp_gems}' #{gem_filename}"
-
-    # Then release
-    sh "git commit lib/cocoapods/gem_version.rb CHANGELOG.md Gemfile.lock -m 'Release #{gem_version}'"
-    sh "git tag -a #{gem_version} -m 'Release #{gem_version}'"
-    sh "git push origin master"
-    sh "git push origin --tags"
-    sh "gem push #{gem_filename}"
-
-    # Update the last version in CocoaPods-version.yml
-    puts "* Updating last known version in Specs repo"
-    specs_branch = 'master'
-    Dir.chdir('../Specs') do
-      puts Dir.pwd
-      sh "git checkout #{specs_branch}"
-      sh "git pull"
-
-      yaml_file  = 'CocoaPods-version.yml'
-      unless File.exist?(yaml_file)
-        $stderr.puts "[!] Unable to find #{yaml_file}!"
-        exit 1
-      end
-      require 'yaml'
-      cocoapods_version = YAML.load_file(yaml_file)
-      cocoapods_version['last'] = gem_version
-      File.open(yaml_file, "w") do |f|
-        f.write(cocoapods_version.to_yaml)
-      end
-
-      sh "git commit #{yaml_file} -m 'CocoaPods release #{gem_version}'"
-      sh "git push"
-    end
-  end
+def gem_version
+  require File.expand_path('../lib/cocoapods/gem_version.rb', __FILE__)
+  Pod::VERSION
 end
-
-#-----------------------------------------------------------------------------#
-
-namespace :spec do
-
-  def specs(dir)
-    FileList["spec/#{dir}/*_spec.rb"].shuffle.join(' ')
-  end
-
-  #--------------------------------------#
-
-  desc "Automatically run specs for updated files"
-  task :kick do
-    exec "bundle exec kicker -c"
-  end
-
-  #--------------------------------------#
-
-  desc "Run the unit specs"
-  task :unit => :unpack_fixture_tarballs do
-    sh "bundle exec bacon #{specs('unit/**')} -q"
-  end
-
-  #--------------------------------------#
-
-  desc "Run the functional specs"
-  task :functional => :unpack_fixture_tarballs do
-    sh "bundle exec bacon #{specs('functional/**')}"
-  end
-
-  #--------------------------------------#
-
-  desc "Run the integration spec"
-  task :integration do
-    unless File.exists?('spec/cocoapods-integration-specs')
-      $stderr.puts "Integration files not checked out. Run `rake bootstrap`"
-      exit 1
-    end
-
-    sh "bundle exec bacon spec/integration.rb"
-  end
-
-  # Default task
-  #--------------------------------------#
-  #
-  # The specs helper interfere with the integration 2 specs and thus they need
-  # to be run separately.
-  #
-  task :all => :unpack_fixture_tarballs do
-    ENV['GENERATE_COVERAGE'] = 'true'
-
-    title 'Running the specs'
-    sh    "bundle exec bacon #{specs('**')}"
-
-    title 'Running Integration tests'
-    sh    "bundle exec bacon spec/integration.rb"
-
-    title 'Running examples'
-    Rake::Task['examples:build'].invoke
-  end
-
-  # Travis
-  #--------------------------------------#
-  #
-  # The integration 2 tests and the examples use the normal CocoaPods setup.
-  #
-  desc "Run all specs and build all examples"
-  task :ci => :unpack_fixture_tarballs do
-    title 'Running the specs'
-    sh "bundle exec bacon #{specs('**')}"
-
-    require 'pathname'
-    unless Pathname.new(ENV['HOME']+'/.cocoapods/repos/master').exist?
-      title 'Ensuring specs repo is up to date'
-      sh    "./bin/pod setup"
-    end
-
-    title 'Running Integration tests'
-    sh "bundle exec bacon spec/integration.rb"
-
-    title 'Running examples'
-    Rake::Task['examples:build'].invoke
-  end
-
-  #--------------------------------------#
-
-  desc "Rebuild all the fixture tarballs"
-  task :rebuild_fixture_tarballs do
-    tarballs = FileList['spec/fixtures/**/*.tar.gz']
-    tarballs.each do |tarball|
-      basename = File.basename(tarball)
-      sh "cd #{File.dirname(tarball)} && rm #{basename} && env COPYFILE_DISABLE=1 tar -zcf #{basename} #{basename[0..-8]}"
-    end
-  end
-
-  #--------------------------------------#
-
-  desc "Unpacks all the fixture tarballs"
-  task :unpack_fixture_tarballs do
-    tarballs = FileList['spec/fixtures/**/*.tar.gz']
-    tarballs.each do |tarball|
-      basename = File.basename(tarball)
-      Dir.chdir(File.dirname(tarball)) do
-        sh "rm -rf #{basename[0..-8]} && tar zxf #{basename}"
-      end
-    end
-  end
-
-  #--------------------------------------#
-
-  desc "Removes the stored VCR fixture"
-  task :clean_vcr do
-    sh "rm -f spec/fixtures/vcr/tarballs.yml"
-  end
-
-  #--------------------------------------#
-
-  desc "Rebuilds integration fixtures"
-  task :rebuild_integration_fixtures do
-    title 'Running Integration tests'
-    `bundle exec bacon spec/integration.rb`
-
-    title 'Storing fixtures'
-    # Copy the files to the files produced by the specs to the after folders
-    FileList['tmp/*'].each do |source|
-      destination = "spec/cocoapods-integration-specs/#{source.gsub('tmp/','')}/after"
-      if File.exists?(destination)
-        sh "rm -rf #{destination}"
-        sh "mv #{source} #{destination}"
-      end
-    end
-
-    # Remove files not used for the comparison
-    # To keep the git diff clean
-    files_to_delete = FileList['spec/cocoapods-integration-specs/*/after/{Podfile,*.podspec,**/*.xcodeproj,PodTest-hg-source}']
-    files_to_delete.exclude('/spec/cocoapods-integration-specs/init_single_platform/**/*.*')
-    files_to_delete.each do |file_to_delete|
-      sh "rm -rf #{file_to_delete}"
-    end
-
-    puts
-    puts "Integration fixtures updated, commit and push in the `spec/cocoapods-integration-specs` submodule"
-  end
-
-  #--------------------------------------#
-
-  task :clean_env => [:clean_vcr, :unpack_fixture_tarballs, "ext:cleanbuild"]
-end
-
-#-----------------------------------------------------------------------------#
-
-task :examples => "examples:build"
-namespace :examples do
-
-  def examples
-    require 'pathname'
-    result = []
-    examples = Pathname.new(File.expand_path('../examples', __FILE__))
-    return [examples + ENV['example']] if ENV['example']
-    examples.entries.each do |example|
-      next if %w{ . .. }.include?(example.basename.to_s)
-      example = examples + example
-      next unless example.directory?
-      result << example
-    end
-    result
-  end
-
-  #--------------------------------------#
-
-  desc "Open all example workspaces in Xcode, which recreates the schemes."
-  task :recreate_workspace_schemes do
-    examples.each do |example|
-      Dir.chdir(example.to_s) do
-        # TODO we need to open the workspace in Xcode at least once, otherwise it might not contain schemes.
-        # The schemes do not seem to survive a SCM round-trip.
-        sh "open '#{example.basename}.xcworkspace'"
-        sleep 5
-      end
-    end
-  end
-
-  #--------------------------------------#
-
-  desc "Build all examples"
-  task :build do
-
-    # TODO: sometimes it uses the installed gem
-    # Rake::Task['gem:install'].invoke
-
-    examples.entries.each do |example|
-      puts "Building example: #{example}"
-      Dir.chdir(example.to_s) do
-        execute_command "rm -rf Pods DerivedData"
-        # WARNING: This appeart to use sytem gems instead of the bundle ones.
-        pod_command = ENV['FROM_GEM'] ? 'sandbox-pod' : 'bundle exec ../../bin/sandbox-pod'
-        execute_command "#{pod_command} install --verbose --no-repo-update"
-        command = "xcodebuild -workspace '#{example.basename}.xcworkspace' -scheme '#{example.basename}'"
-          if (example + 'Podfile').read.include?('platform :ios')
-            # Specifically build against the simulator SDK so we don't have to deal with code signing.
-            xcode_version = `xcodebuild -version`.scan(/Xcode (.*)\n/).first.first
-            major_version = xcode_version.split('.').first.to_i
-            destination_flag_supported = major_version > 4
-            if destination_flag_supported
-              command << " -destination 'platform=iOS Simulator,name=iPhone Retina (4-inch)'"
-            else
-              command << " -sdk "
-              command << Dir.glob("#{`xcode-select -print-path`.chomp}/Platforms/iPhoneSimulator.platform/Developer/SDKs/iPhoneSimulator*.sdk").last
-            end
-          end
-        execute_command(command)
-      end
-    end
-  end
-
-  #--------------------------------------#
-
-end
-
-#-----------------------------------------------------------------------------#
-
-desc "Initializes your working copy to run the specs"
-task :bootstrap, :use_bundle_dir? do |t, args|
-  title "Environment bootstrap"
-
-  puts "Updating submodules"
-  execute_command "git submodule update --init --recursive"
-
-  puts "Installing gems"
-  if args[:use_bundle_dir?]
-    execute_command "bundle install --path ./travis_bundle_dir"
-  else
-    execute_command "bundle install"
-  end
-end
-
-#-----------------------------------------------------------------------------#
-
-desc "Run all specs"
-task :spec => 'spec:all'
-
-task :default => :spec
-
-#-----------------------------------------------------------------------------#
-
-# group helpers
 
 def title(title)
   cyan_title = "\033[0;36m#{title}\033[0m"
   puts
-  puts "-" * 80
+  puts '-' * 80
   puts cyan_title
-  puts "-" * 80
+  puts '-' * 80
   puts
 end
 
+def green(string)
+  "\033[0;32m#{string}\e[0m"
+end
+
+def red(string)
+  "\033[0;31m#{string}\e[0m"
+end
+
+def yellow(string)
+  "\033[0;33m#{string}\e[0m"
+end

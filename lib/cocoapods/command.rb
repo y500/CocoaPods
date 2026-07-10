@@ -1,5 +1,12 @@
-require 'colored'
+require 'colored2'
 require 'claide'
+require 'molinillo/errors'
+
+module Molinillo
+  class ResolverError
+    include CLAide::InformativeError
+  end
+end
 
 module Pod
   class PlainInformative
@@ -7,58 +14,57 @@ module Pod
   end
 
   class Command < CLAide::Command
+    require 'cocoapods/command/options/repo_update'
+    require 'cocoapods/command/options/project_directory'
+    include Options
 
-    require 'cocoapods/command/help'
-    require 'cocoapods/command/inter_process_communication'
+    require 'cocoapods/command/cache'
+    require 'cocoapods/command/env'
+    require 'cocoapods/command/init'
+    require 'cocoapods/command/install'
+    require 'cocoapods/command/ipc'
     require 'cocoapods/command/lib'
     require 'cocoapods/command/list'
     require 'cocoapods/command/outdated'
-    require 'cocoapods/command/podfile_info'
-    require 'cocoapods/command/project'
-    require 'cocoapods/command/push'
     require 'cocoapods/command/repo'
-    require 'cocoapods/command/search'
     require 'cocoapods/command/setup'
     require 'cocoapods/command/spec'
-    require 'cocoapods/command/init'
+    require 'cocoapods/command/update'
 
     self.abstract_command = true
-    self.default_subcommand = 'install'
     self.command = 'pod'
-    self.description = 'CocoaPods, the Objective-C library package manager.'
+    self.version = VERSION
+    self.description = 'CocoaPods, the Cocoa library package manager.'
+    self.plugin_prefixes = %w(claide cocoapods)
 
     def self.options
       [
-        ['--silent',   'Show nothing'],
-        ['--version',  'Show the version of CocoaPods'],
+        ['--allow-root', 'Allows CocoaPods to run as root'],
+        ['--silent', 'Show nothing'],
       ].concat(super)
     end
 
-    def self.parse(argv)
-      command = super
-      unless SourcesManager.master_repo_functional? || command.is_a?(Setup) || command.is_a?(Repo::Add) || ENV['SKIP_SETUP']
-        Setup.new(CLAide::ARGV.new([])).run
-      end
-      command
-    end
-
     def self.run(argv)
-      argv = CLAide::ARGV.new(argv)
-      if argv.flag?('version')
-        puts VERSION
-        exit!(0)
-      end
+      ensure_not_root_or_allowed! argv
+      verify_minimum_git_version!
+      verify_xcode_license_approved!
+
       super(argv)
+    ensure
       UI.print_warnings
     end
 
     def self.report_error(exception)
-      if exception.is_a?(Interrupt)
-        puts "[!] Cancelled".red
+      case exception
+      when Interrupt
+        puts '[!] Cancelled'.red
         Config.instance.verbose? ? raise : exit(1)
+      when SystemExit
+        raise
       else
         if ENV['COCOA_PODS_ENV'] != 'development'
           puts UI::ErrorReport.report(exception)
+          UI::ErrorReport.search_for_exceptions(exception)
           exit 1
         else
           raise exception
@@ -79,9 +85,30 @@ module Pod
     def initialize(argv)
       super
       config.silent = argv.flag?('silent', config.silent)
-      config.verbose = self.verbose? unless self.verbose.nil?
-      unless self.colorize_output?
-        String.send(:define_method, :colorize) { |string , _| string }
+      config.allow_root = argv.flag?('allow-root', config.allow_root)
+      config.verbose = self.verbose? unless verbose.nil?
+      unless self.ansi_output?
+        Colored2.disable!
+        String.send(:define_method, :colorize) { |string, _| string }
+      end
+    end
+
+    # Ensure root user
+    #
+    # @return [void]
+    #
+    def self.ensure_not_root_or_allowed!(argv, uid = Process.uid, is_windows = Gem.win_platform?)
+      root_allowed = argv.include?('--allow-root') || !ENV['COCOAPODS_ALLOW_ROOT'].nil?
+      help! 'You cannot run CocoaPods as root.' unless root_allowed || uid != 0 || is_windows
+    end
+
+    # Ensure that the master spec repo exists
+    #
+    # @return [void]
+    #
+    def ensure_master_spec_repo_exists!
+      unless config.sources_manager.master_repo_functional?
+        Setup.new(CLAide::ARGV.new([])).run
       end
     end
 
@@ -91,6 +118,38 @@ module Pod
 
     private
 
+    # Returns a new {Gem::Version} based on the systems `git` version.
+    #
+    # @return [Gem::Version]
+    #
+    def self.git_version
+      raw_version = Executable.capture_command('git', ['--version']).first
+      unless match = raw_version.scan(/\d+\.\d+\.\d+/).first
+        raise "Failed to extract git version from `git --version` (#{raw_version.inspect})"
+      end
+      Gem::Version.new(match)
+    end
+
+    # Checks that the git version is at least 1.8.5
+    #
+    # @raise If the git version is older than 1.8.5
+    #
+    # @return [void]
+    #
+    def self.verify_minimum_git_version!
+      if git_version < Gem::Version.new('1.8.5')
+        raise Informative, 'You need at least git version 1.8.5 to use CocoaPods'
+      end
+    end
+
+    # Returns a new {Installer} parametrized from the {Config}.
+    #
+    # @return [Installer]
+    #
+    def installer_for_config
+      Installer.new(config.sandbox, config.podfile, config.lockfile)
+    end
+
     # Checks that the podfile exists.
     #
     # @raise  If the podfile does not exists.
@@ -99,7 +158,7 @@ module Pod
     #
     def verify_podfile_exists!
       unless config.podfile
-        raise Informative, "No `Podfile' found in the current working directory."
+        raise Informative, "No `Podfile' found in the project directory."
       end
     end
 
@@ -111,9 +170,16 @@ module Pod
     #
     def verify_lockfile_exists!
       unless config.lockfile
-        raise Informative, "No `Podfile.lock' found in the current working directory, run `pod install'."
+        raise Informative, "No `Podfile.lock' found in the project directory, run `pod install'."
+      end
+    end
+
+    def self.verify_xcode_license_approved!
+      if `/usr/bin/xcrun clang 2>&1` =~ /license/ && !$?.success?
+        raise Informative, 'You have not agreed to the Xcode license, which ' \
+          'you must do to use CocoaPods. Agree to the license by running: ' \
+          '`xcodebuild -license`.'
       end
     end
   end
 end
-

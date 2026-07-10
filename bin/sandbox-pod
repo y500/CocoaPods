@@ -52,7 +52,7 @@ PROFILE_ERB_TEMPLATE = <<-EOS
     "<%= pod_bin %>"
     "<%= ruby_bin %>"
   )
-  (regex 
+  (regex
 <% prefixes.each do |prefix| %>
     #"^<%= prefix %>/*"
 <% end %>
@@ -61,7 +61,7 @@ PROFILE_ERB_TEMPLATE = <<-EOS
 
 (allow file-read-metadata)
 (allow file-read*
-  ; This is currenly only added because using `xcodebuild` to build a resource
+  ; This is currently only added because using `xcodebuild` to build a resource
   ; bundle target starts a FSEvents stream on `/`. No idea why that would be
   ; needed, but for now it doesn’t seem like a real problem.
   (literal "/")
@@ -105,9 +105,7 @@ PROFILE_ERB_TEMPLATE = <<-EOS
 (deny default)
 EOS
 
-
 class Profile
-
   def pod_bin
     File.expand_path('../pod', __FILE__)
   end
@@ -155,18 +153,16 @@ class Profile
     File.expand_path('../..', developer_prefix)
   end
 
-  # TODO raise SAFE level (0) to 4 if possible.
+  # TODO: raise SAFE level (0) to 4 if possible.
   def generate
     ERB.new(PROFILE_ERB_TEMPLATE, 0, '>').result(binding)
   end
-
 end
 
 # Ensure the `pod` bin doesn’t think it needs to use Bundler.
 ENV['COCOAPODS_NO_BUNDLER'] = '1'
 
 profile = Profile.new
-#puts profile.generate
+# puts profile.generate
 command = ['/usr/bin/sandbox-exec', '-p', profile.generate, profile.pod_bin, *ARGV]
 exec(*command)
-
